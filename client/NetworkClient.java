@@ -43,7 +43,6 @@ public class NetworkClient {
                 break;
             }
 
-            // Пытаемся выполнить команду с переподключением
             boolean success = executeWithReconnect(input.trim());
             if (!success && running) {
                 System.out.println("Команда не выполнена. Сервер недоступен.");
@@ -57,12 +56,10 @@ public class NetworkClient {
         int attempts = 0;
         while (attempts < MAX_RECONNECT_ATTEMPTS && running) {
             try {
-                // Проверяем соединение
                 if (channel == null || !channel.isOpen() || !channel.isConnected()) {
                     connect();
                 }
 
-                // Выполняем команду
                 processCommand(input);
                 return true;
 
@@ -117,7 +114,6 @@ public class NetworkClient {
         Command command = commandReader.readCommand(input);
         if (command == null) return;
 
-        // Сериализуем запрос в байты
         Request request = new Request(command);
         byte[] data = serialize(request);
 
@@ -130,7 +126,6 @@ public class NetworkClient {
         ByteBuffer dataBuffer = ByteBuffer.wrap(data);
         channel.write(dataBuffer);
 
-        // Читаем ответ (с таймаутом)
         ByteBuffer responseLengthBuffer = ByteBuffer.allocate(4);
         int bytesRead = 0;
         while (responseLengthBuffer.hasRemaining() && bytesRead != -1) {
