@@ -16,7 +16,6 @@ public class ServerCore {
     private Selector selector;
     private ServerSocketChannel serverChannel;
 
-    // Храним недополученные данные для каждого клиента
     private final Map<SocketChannel, ByteArrayOutputStream> pendingData = new ConcurrentHashMap<>();
     private final Map<SocketChannel, Integer> expectedLength = new ConcurrentHashMap<>();
 
@@ -90,12 +89,10 @@ public class ServerCore {
             buffer.get(data);
             baos.write(data);
 
-            // Пытаемся обработать данные
             byte[] fullData = baos.toByteArray();
             ByteArrayInputStream bais = new ByteArrayInputStream(fullData);
 
             while (bais.available() > 0) {
-                // Сначала читаем длину сообщения (4 байта)
                 Integer length = expectedLength.get(client);
                 if (length == null) {
                     if (bais.available() < 4) break;
@@ -105,12 +102,10 @@ public class ServerCore {
                     expectedLength.put(client, length);
                 }
 
-                // Потом читаем само сообщение
                 if (bais.available() < length) break;
                 byte[] msgBytes = new byte[length];
                 bais.read(msgBytes);
 
-                // Десериализуем запрос
                 Request request = deserialize(msgBytes);
                 if (request != null) {
                     ServerLogger.info("Получена команда: " + request.getCommand().getName());
@@ -119,11 +114,9 @@ public class ServerCore {
                     sendResponse(client, responseData);
                 }
 
-                // Очищаем ожидаемую длину для следующего сообщения
                 expectedLength.remove(client);
             }
 
-            // Сохраняем остаток для следующего раза
             byte[] remaining = new byte[bais.available()];
             bais.read(remaining);
             baos.reset();
@@ -137,7 +130,6 @@ public class ServerCore {
 
     private void sendResponse(SocketChannel client, byte[] data) {
         try {
-            // Отправляем длину + данные
             ByteBuffer lengthBuffer = ByteBuffer.allocate(4);
             lengthBuffer.putInt(data.length);
             lengthBuffer.flip();
