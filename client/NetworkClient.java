@@ -17,6 +17,8 @@ public class NetworkClient {
     private InputValidator validator;
     private CommandReader commandReader;
     private boolean running;
+    private static final int MAX_RECONNECT_ATTEMPTS = 5;
+    private static final int RECONNECT_DELAY_MS = 2000;
 
     public NetworkClient(String host, int port) {
         this.host = host;
@@ -27,112 +29,153 @@ public class NetworkClient {
     }
 
     public void start() {
-        try {
-            connect();
-            System.out.println("Подключено к серверу " + host + ":" + port);
-            System.out.println("Введите 'help' для списка команд\n");
+        System.out.println("Подключено к серверу " + host + ":" + port);
+        System.out.println("Введите 'help' для списка команд\n");
 
-            while (running) {
-                System.out.print("> ");
-                String input = validator.readLine(null);
-                if (input == null || input.trim().isEmpty()) continue;
+        while (running) {
+            System.out.print("> ");
+            String input = validator.readLine(null);
+            if (input == null || input.trim().isEmpty()) continue;
 
-                processCommand(input.trim());
+            if (input.trim().equalsIgnoreCase("exit")) {
+                running = false;
+                System.out.println("До свидания!");
+                break;
             }
-        } catch (Exception e) {
-            System.err.println("Ошибка: " + e.getMessage());
-            e.printStackTrace();
-        } finally {
-            disconnect();
+
+            // Пытаемся выполнить команду с переподключением
+            boolean success = executeWithReconnect(input.trim());
+            if (!success && running) {
+                System.out.println("Команда не выполнена. Сервер недоступен.");
+            }
         }
+
+        disconnect();
+    }
+
+    private boolean executeWithReconnect(String input) {
+        int attempts = 0;
+        while (attempts < MAX_RECONNECT_ATTEMPTS && running) {
+            try {
+                // Проверяем соединение
+                if (channel == null || !channel.isOpen() || !channel.isConnected()) {
+                    connect();
+                }
+
+                // Выполняем команду
+                processCommand(input);
+                return true;
+
+            } catch (SocketTimeoutException e) {
+                System.out.println("Сервер не отвечает. Попытка " + (attempts + 1) + "/" + MAX_RECONNECT_ATTEMPTS);
+                attempts++;
+                if (attempts < MAX_RECONNECT_ATTEMPTS) {
+                    try {
+                        Thread.sleep(RECONNECT_DELAY_MS);
+                    } catch (InterruptedException ignored) {}
+                }
+
+            } catch (IOException e) {
+                System.out.println("Соединение потеряно. Переподключение... Попытка " + (attempts + 1) + "/" + MAX_RECONNECT_ATTEMPTS);
+                attempts++;
+                disconnect();
+                if (attempts < MAX_RECONNECT_ATTEMPTS) {
+                    try {
+                        Thread.sleep(RECONNECT_DELAY_MS);
+                    } catch (InterruptedException ignored) {}
+                }
+
+            } catch (ClassNotFoundException e) {
+                System.err.println("Ошибка протокола: " + e.getMessage());
+                return false;
+            }
+        }
+        return false;
     }
 
     private void connect() throws IOException {
+        disconnect();
         channel = SocketChannel.open();
-        channel.connect(new InetSocketAddress(host, port));
-        channel.configureBlocking(true); // клиент может быть блокирующим
+        channel.socket().connect(new InetSocketAddress(host, port), 3000);
+        channel.configureBlocking(true);
+        channel.socket().setSoTimeout(5000);
+        System.out.println("Переподключено к серверу");
     }
 
     private void disconnect() {
         try {
-            if (channel != null) channel.close();
-        } catch (IOException e) {}
+            if (channel != null) {
+                channel.close();
+            }
+        } catch (IOException e) {
+            // ignore
+        }
+        channel = null;
     }
 
-    private void processCommand(String input) {
-        try {
-            Command command = commandReader.readCommand(input);
-            if (command == null) return;
+    private void processCommand(String input) throws IOException, ClassNotFoundException {
+        Command command = commandReader.readCommand(input);
+        if (command == null) return;
 
-            if (command instanceof ExitCommand) {
-                running = false;
-                System.out.println("До свидания!");
-                return;
+        // Сериализуем запрос в байты
+        Request request = new Request(command);
+        byte[] data = serialize(request);
+
+        // Отправляем длину + данные
+        ByteBuffer lengthBuffer = ByteBuffer.allocate(4);
+        lengthBuffer.putInt(data.length);
+        lengthBuffer.flip();
+        channel.write(lengthBuffer);
+
+        ByteBuffer dataBuffer = ByteBuffer.wrap(data);
+        channel.write(dataBuffer);
+
+        // Читаем ответ (с таймаутом)
+        ByteBuffer responseLengthBuffer = ByteBuffer.allocate(4);
+        int bytesRead = 0;
+        while (responseLengthBuffer.hasRemaining() && bytesRead != -1) {
+            bytesRead = channel.read(responseLengthBuffer);
+            if (bytesRead == -1) throw new EOFException("Сервер закрыл соединение");
+        }
+        responseLengthBuffer.flip();
+        int responseLength = responseLengthBuffer.getInt();
+
+        if (responseLength <= 0 || responseLength > 10 * 1024 * 1024) {
+            throw new IOException("Неверная длина ответа: " + responseLength);
+        }
+
+        ByteBuffer responseBuffer = ByteBuffer.allocate(responseLength);
+        while (responseBuffer.hasRemaining() && bytesRead != -1) {
+            bytesRead = channel.read(responseBuffer);
+            if (bytesRead == -1) throw new EOFException("Сервер закрыл соединение");
+        }
+
+        Response response = deserialize(responseBuffer.array());
+
+        if (response.isSuccess()) {
+            if (response.getData() != null) {
+                System.out.println(response.getData());
+            } else if (!response.getMessage().isEmpty()) {
+                System.out.println(response.getMessage());
             }
-
-            // Сериализуем запрос в байты
-            Request request = new Request(command);
-            byte[] data = serialize(request);
-
-            // Отправляем длину + данные
-            ByteBuffer lengthBuffer = ByteBuffer.allocate(4);
-            lengthBuffer.putInt(data.length);
-            lengthBuffer.flip();
-            channel.write(lengthBuffer);
-
-            ByteBuffer dataBuffer = ByteBuffer.wrap(data);
-            channel.write(dataBuffer);
-
-            // Читаем ответ
-            ByteBuffer responseLengthBuffer = ByteBuffer.allocate(4);
-            while (responseLengthBuffer.hasRemaining()) {
-                channel.read(responseLengthBuffer);
-            }
-            responseLengthBuffer.flip();
-            int responseLength = responseLengthBuffer.getInt();
-
-            ByteBuffer responseBuffer = ByteBuffer.allocate(responseLength);
-            while (responseBuffer.hasRemaining()) {
-                channel.read(responseBuffer);
-            }
-
-            Response response = deserialize(responseBuffer.array());
-
-            if (response.isSuccess()) {
-                if (response.getData() != null) {
-                    System.out.println(response.getData());
-                } else if (!response.getMessage().isEmpty()) {
-                    System.out.println(response.getMessage());
-                }
-            } else {
-                System.err.println("Ошибка: " + response.getMessage());
-            }
-
-        } catch (IOException e) {
-            System.err.println("Ошибка соединения: " + e.getMessage());
-            running = false;
+        } else {
+            System.err.println("Ошибка: " + response.getMessage());
         }
     }
 
-    private byte[] serialize(Object obj) {
+    private byte[] serialize(Object obj) throws IOException {
         try (ByteArrayOutputStream bos = new ByteArrayOutputStream();
              ObjectOutputStream oos = new ObjectOutputStream(bos)) {
             oos.writeObject(obj);
             oos.flush();
             return bos.toByteArray();
-        } catch (IOException e) {
-            System.err.println("Ошибка сериализации: " + e.getMessage());
-            return new byte[0];
         }
     }
 
-    private Response deserialize(byte[] data) {
+    private Response deserialize(byte[] data) throws IOException, ClassNotFoundException {
         try (ByteArrayInputStream bis = new ByteArrayInputStream(data);
              ObjectInputStream ois = new ObjectInputStream(bis)) {
             return (Response) ois.readObject();
-        } catch (IOException | ClassNotFoundException e) {
-            System.err.println("Ошибка десериализации: " + e.getMessage());
-            return new Response(false, "Ошибка десериализации");
         }
     }
 }
